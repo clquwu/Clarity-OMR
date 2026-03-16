@@ -168,8 +168,6 @@ def _run_stage_b_inference_with_progress(
     quiet: bool,
     length_penalty_alpha: float = 0.6,
     use_kv_cache: bool = True,
-    use_fp16: bool = False,
-    quantize: bool = False,
 ) -> Dict[str, object]:
     import torch
 
@@ -177,7 +175,9 @@ def _run_stage_b_inference_with_progress(
         _decode_stage_b_tokens,
         _encode_staff_image,
         _load_stage_b_crop_tensor,
+        _load_stage_b_checkpoint_payload,
         _load_stage_b_state_dict,
+        _prepare_decoder_memory_cache,
         _prepare_model_for_inference,
     )
     from src.tokenizer.vocab import build_default_vocabulary
@@ -196,7 +196,7 @@ def _run_stage_b_inference_with_progress(
     device = torch.device(cleaned_device if cleaned_device else ("cuda" if torch.cuda.is_available() else "cpu"))
 
     vocab = build_default_vocabulary()
-    payload = torch.load(str(checkpoint), map_location=device)
+    payload = _load_stage_b_checkpoint_payload(checkpoint, device)
     fallback_factory_cfg = ModelFactoryConfig(stage_b_vocab_size=vocab.size)
     factory_cfg = model_factory_config_from_checkpoint_payload(
         payload,
@@ -233,7 +233,7 @@ def _run_stage_b_inference_with_progress(
     model.eval()
 
     # Prepare model once for all crops
-    decode_model, use_fp16 = _prepare_model_for_inference(model, device, use_fp16=use_fp16, quantize=quantize)
+    decode_model = _prepare_model_for_inference(model)
     _token_to_idx = {token: idx for idx, token in enumerate(vocab.tokens)}
 
     output_predictions.parent.mkdir(parents=True, exist_ok=True)
@@ -272,9 +272,8 @@ def _run_stage_b_inference_with_progress(
                 image_max_width=max(256, int(image_max_width)),
                 device=device,
             )
-            if use_fp16:
-                pixel_values = pixel_values.half()
             memory = _encode_staff_image(decode_model, pixel_values)
+            encoder_kv_cache = _prepare_decoder_memory_cache(decode_model, memory)
 
             tokens = _decode_stage_b_tokens(
                 model=model,
@@ -287,8 +286,8 @@ def _run_stage_b_inference_with_progress(
                 _precomputed={
                     "decode_model": decode_model,
                     "memory": memory,
+                    "encoder_kv_cache": encoder_kv_cache,
                     "token_to_idx": _token_to_idx,
-                    "use_fp16": use_fp16,
                 },
             )
             row_with_tokens = dict(row)
@@ -340,7 +339,7 @@ def parse_args() -> argparse.Namespace:
         "--checkpoint",
         type=Path,
         required=True,
-        help="Stage-B checkpoint path (.pt).",
+        help="Stage-B checkpoint path (.safetensors).",
     )
     parser.add_argument(
         "--token-manifest",
@@ -383,7 +382,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--image-height", type=int, default=250, help="Stage-B input image height.")
     parser.add_argument("--image-max-width", type=int, default=2500, help="Stage-B input image max width (max 3000).")
     parser.add_argument("--device", type=str, default=None, help="Inference device (e.g. cuda, cpu).")
-    parser.add_argument("--quantize", action="store_true", help="INT8 dynamic quantization on decoder (CPU: 2-3x faster, GPU: needs torchao).")
     parser.add_argument(
         "--fast",
         action="store_true",
@@ -493,7 +491,6 @@ def main() -> None:
         quiet=bool(args.quiet),
         length_penalty_alpha=float(args.length_penalty_alpha),
         use_kv_cache=bool(args.kv_cache),
-        quantize=bool(getattr(args, "quantize", False)),
     )
 
     raw_prediction_rows = _read_jsonl(raw_predictions_path)

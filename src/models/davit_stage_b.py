@@ -427,11 +427,27 @@ class DecoderBlock(nn.Module):
             new_past = (k, v)
         return hidden + self.dropout(attn), new_past
 
-    def _cross_attention(self, hidden: torch.Tensor, memory: torch.Tensor) -> torch.Tensor:
-        query = self.norm2(hidden)
-        q = _reshape_to_heads(self.cross_attn_q(query), self.heads)
+    def prepare_cross_attention_memory(
+        self,
+        memory: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         k = _reshape_to_heads(self.cross_attn_k(memory), self.heads)
         v = _reshape_to_heads(self.cross_attn_v(memory), self.heads)
+        return k, v
+
+    def _cross_attention(
+        self,
+        hidden: torch.Tensor,
+        memory: torch.Tensor,
+        *,
+        cross_attn_kv: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    ) -> torch.Tensor:
+        query = self.norm2(hidden)
+        q = _reshape_to_heads(self.cross_attn_q(query), self.heads)
+        if cross_attn_kv is None:
+            k, v = self.prepare_cross_attention_memory(memory)
+        else:
+            k, v = cross_attn_kv
         attn = _run_attention(q, k, v, causal=False)
         attn = self.cross_attn_out(_reshape_from_heads(attn))
         return hidden + self.dropout(attn)
@@ -449,9 +465,10 @@ class DecoderBlock(nn.Module):
         *,
         past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         use_cache: bool = False,
+        cross_attn_kv: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
         hidden, new_past = self._self_attention(hidden, past_key_value=past_key_value, use_cache=use_cache)
-        hidden = self._cross_attention(hidden, memory)
+        hidden = self._cross_attention(hidden, memory, cross_attn_kv=cross_attn_kv)
         return self._ffn(hidden), new_past
 
 
@@ -495,6 +512,12 @@ class StageBModel(nn.Module):
         contour_logits = self.contour_head(memory.mean(dim=1))
         return memory, contour_logits
 
+    def prepare_decoder_memory(
+        self,
+        memory: torch.Tensor,
+    ) -> Tuple[Tuple[torch.Tensor, torch.Tensor], ...]:
+        return tuple(block.prepare_cross_attention_memory(memory) for block in self.decoder_blocks)
+
     def decode_tokens(
         self,
         decoder_input_ids: torch.Tensor,
@@ -502,6 +525,7 @@ class StageBModel(nn.Module):
         *,
         past_key_values: Optional[Tuple[Tuple[torch.Tensor, torch.Tensor], ...]] = None,
         use_cache: bool = False,
+        encoder_kv_cache: Optional[Tuple[Tuple[torch.Tensor, torch.Tensor], ...]] = None,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor,
@@ -512,14 +536,20 @@ class StageBModel(nn.Module):
             raise ValueError(
                 f"past_key_values length mismatch: expected {len(self.decoder_blocks)}, got {len(past_key_values)}."
             )
+        if encoder_kv_cache is not None and len(encoder_kv_cache) != len(self.decoder_blocks):
+            raise ValueError(
+                f"encoder_kv_cache length mismatch: expected {len(self.decoder_blocks)}, got {len(encoder_kv_cache)}."
+            )
         next_past: list[Tuple[torch.Tensor, torch.Tensor]] = []
         for layer_idx, block in enumerate(self.decoder_blocks):
             layer_past = past_key_values[layer_idx] if past_key_values is not None else None
+            layer_encoder_kv = encoder_kv_cache[layer_idx] if encoder_kv_cache is not None else None
             hidden, layer_next_past = block(
                 hidden,
                 memory,
                 past_key_value=layer_past,
                 use_cache=use_cache,
+                cross_attn_kv=layer_encoder_kv,
             )
             if use_cache:
                 if layer_next_past is None:

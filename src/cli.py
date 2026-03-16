@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -79,9 +80,7 @@ def run_stage_a(args: argparse.Namespace) -> Dict[str, object]:
 
 
 def _load_stage_b_state_dict(checkpoint_path: Path, device) -> Dict[str, object]:
-    import torch
-
-    payload = torch.load(str(checkpoint_path), map_location=device)
+    payload = _load_stage_b_checkpoint_payload(checkpoint_path, device)
     state_dict = payload.get("model_state_dict", payload) if isinstance(payload, dict) else payload
     if not isinstance(state_dict, dict):
         raise RuntimeError(f"Unsupported checkpoint format: {checkpoint_path}")
@@ -95,6 +94,32 @@ def _load_stage_b_state_dict(checkpoint_path: Path, device) -> Dict[str, object]
                 break
         normalized[key] = tensor
     return normalized
+
+
+def _load_stage_b_checkpoint_payload(checkpoint_path: Path, device) -> Dict[str, object]:
+    from safetensors import safe_open
+    from safetensors.torch import load_file
+
+    if checkpoint_path.suffix.lower() != ".safetensors":
+        raise RuntimeError(
+            f"Unsupported Stage-B checkpoint format: {checkpoint_path}. "
+            "Only .safetensors checkpoints are supported."
+        )
+
+    state_dict = load_file(str(checkpoint_path), device=str(device))
+    with safe_open(str(checkpoint_path), framework="pt", device=str(device)) as handle:
+        metadata = handle.metadata() or {}
+    return {
+        "model_state_dict": state_dict,
+        "stage_b_config": {
+            "max_decode_length": int(metadata.get("max_decode_length", 512)),
+            "pretrained_backbone": str(metadata.get("backbone", "davit_base.msft_in1k")),
+            "decoder_dim": int(metadata.get("decoder_dim", 768)),
+            "decoder_layers": int(metadata.get("decoder_layers", 8)),
+            "decoder_heads": int(metadata.get("decoder_heads", 12)),
+            "dora_rank": int(metadata.get("dora_rank", 16)),
+        },
+    }
 
 
 def _load_stage_b_crop_tensor(
@@ -121,24 +146,36 @@ def _load_stage_b_crop_tensor(
 
 
 class _LazyLogitDict:
-    """Dict-like wrapper that extracts tensor values on demand.
+    """Dict-like wrapper that extracts only the needed token scores.
 
-    Beam search only accesses ~20-50 grammar-valid tokens per step,
-    but the full vocab has ~374 tokens.  This avoids ~320 unnecessary
-    ``.item()`` calls per step (× beam_width × decode_steps).
+    On GPU, beam search should avoid copying the full vocabulary logits back to
+    CPU each step. ``score_tokens`` gathers only the grammar-valid subset,
+    which materially reduces CUDA sync overhead during decoding.
     """
 
     __slots__ = ("_tensor", "_idx")
 
-    def __init__(self, log_probs_cpu, token_to_idx: Dict[str, int]) -> None:
-        self._tensor = log_probs_cpu
+    def __init__(self, log_probs, token_to_idx: Dict[str, int]) -> None:
+        self._tensor = log_probs
         self._idx = token_to_idx
 
     def __contains__(self, token: str) -> bool:
         return token in self._idx
 
     def __getitem__(self, token: str) -> float:
-        return self._tensor[self._idx[token]].item()
+        return float(self._tensor[self._idx[token]].item())
+
+    def score_tokens(self, tokens: Sequence[str]) -> Dict[str, float]:
+        valid_pairs = [(token, self._idx[token]) for token in tokens if token in self._idx]
+        if not valid_pairs:
+            return {}
+        token_names = [token for token, _ in valid_pairs]
+        token_indices = [idx for _, idx in valid_pairs]
+        import torch
+
+        index_tensor = torch.tensor(token_indices, dtype=torch.long, device=self._tensor.device)
+        gathered = self._tensor.index_select(0, index_tensor).detach().cpu().tolist()
+        return {token: float(score) for token, score in zip(token_names, gathered)}
 
 
 def _resolve_stage_b_decode_model(obj):
@@ -155,63 +192,11 @@ def _resolve_stage_b_decode_model(obj):
     raise RuntimeError("Loaded Stage-B model does not expose encode_staff/decode_tokens for Stage-B decoding.")
 
 
-def _quantize_decoder(decode_model, device):
-    """Apply INT8 dynamic quantization to decoder nn.Linear layers.
-
-    On CPU: uses built-in torch.quantization.quantize_dynamic (2-3x speedup).
-    On GPU: tries torchao if installed, otherwise skips with warning.
-    Returns the (possibly quantized) model and whether quantization was applied.
-    """
-    import sys
-    import torch
-
-    if device.type == "cpu":
-        try:
-            quantized = torch.quantization.quantize_dynamic(
-                decode_model,
-                {torch.nn.Linear},
-                dtype=torch.qint8,
-            )
-            print("[inference] INT8 dynamic quantization applied (CPU)", file=sys.stderr)
-            return quantized, True
-        except Exception as exc:
-            print(f"[inference] quantization failed, skipping: {exc}", file=sys.stderr)
-            return decode_model, False
-
-    # GPU: try torchao for device-agnostic INT8
-    try:
-        from torchao.quantization import int8_weight_only, quantize_
-        quantize_(decode_model, int8_weight_only())
-        print("[inference] INT8 weight-only quantization applied (CUDA via torchao)", file=sys.stderr)
-        return decode_model, True
-    except ImportError:
-        print(
-            "[inference] torchao not installed, GPU quantization skipped. "
-            "Install with: pip install torchao",
-            file=sys.stderr,
-        )
-        return decode_model, False
-    except Exception as exc:
-        print(f"[inference] GPU quantization failed, skipping: {exc}", file=sys.stderr)
-        return decode_model, False
-
-
-def _prepare_model_for_inference(model, device, *, use_fp16: bool = False, quantize: bool = False):
-    """Prepare model for inference: unwrap, eval mode, optional FP16/quantization."""
-    import torch
-
+def _prepare_model_for_inference(model):
+    """Prepare model for inference."""
     decode_model = _resolve_stage_b_decode_model(model)
-    if use_fp16 and device.type == "cuda":
-        decode_model = decode_model.half()
-    else:
-        use_fp16 = False
     decode_model.eval()
-    if quantize and not use_fp16:
-        decode_model, _ = _quantize_decoder(decode_model, device)
-    elif quantize and use_fp16:
-        import sys
-        print("[inference] --quantize and --fp16 are mutually exclusive, skipping quantization", file=sys.stderr)
-    return decode_model, use_fp16
+    return decode_model
 
 
 def _encode_staff_image(decode_model, pixel_values):
@@ -231,6 +216,376 @@ def _encode_staff_image(decode_model, pixel_values):
     return encoded
 
 
+def _prepare_decoder_memory_cache(decode_model, memory):
+    """Precompute per-layer cross-attention K/V for a fixed encoder memory."""
+    import torch
+
+    prepare_decoder_memory = getattr(decode_model, "prepare_decoder_memory", None)
+    if not callable(prepare_decoder_memory):
+        return None
+    with torch.inference_mode():
+        return prepare_decoder_memory(memory)
+
+
+@dataclass(frozen=True, slots=True)
+class _BeamDecodeState:
+    token_ids: Tuple[int, ...]
+    cache: object | None = None
+
+    @property
+    def last_token_id(self) -> int:
+        return int(self.token_ids[-1])
+
+    def append(self, token_id: int, cache: object | None) -> "_BeamDecodeState":
+        return _BeamDecodeState(token_ids=(*self.token_ids, int(token_id)), cache=cache)
+
+
+def _expand_encoder_kv_cache(encoder_kv_cache, batch_size: int):
+    if encoder_kv_cache is None:
+        return None
+    return tuple(
+        (
+            key.expand(batch_size, -1, -1, -1),
+            value.expand(batch_size, -1, -1, -1),
+        )
+        for key, value in encoder_kv_cache
+    )
+
+
+def _stack_past_key_values(caches):
+    import torch
+
+    if not caches:
+        return None
+    num_layers = len(caches[0])
+    return tuple(
+        (
+            torch.cat([cache[layer_idx][0] for cache in caches], dim=0),
+            torch.cat([cache[layer_idx][1] for cache in caches], dim=0),
+        )
+        for layer_idx in range(num_layers)
+    )
+
+
+def _slice_past_key_values(cache, row_index: int):
+    if cache is None:
+        return None
+    return tuple(
+        (
+            key[row_index : row_index + 1],
+            value[row_index : row_index + 1],
+        )
+        for key, value in cache
+    )
+
+
+def _lookup_valid_token_index(
+    valid_tokens: Sequence[str],
+    *,
+    token_to_idx: Dict[str, int],
+    device,
+    cache: Dict[frozenset[str], Tuple[List[str], object]],
+) -> Tuple[List[str], object | None]:
+    valid_key = frozenset(token for token in valid_tokens if token in token_to_idx)
+    if not valid_key:
+        return [], None
+    cached = cache.get(valid_key)
+    if cached is not None:
+        return cached
+
+    import torch
+
+    token_names = sorted(valid_key)
+    token_indices = torch.tensor(
+        [token_to_idx[token] for token in token_names],
+        dtype=torch.long,
+        device=device,
+    )
+    cache[valid_key] = (token_names, token_indices)
+    return token_names, token_indices
+
+
+def _decode_stage_b_tokens_batched(
+    *,
+    decode_model,
+    memory,
+    vocabulary,
+    beam_width: int,
+    max_decode_steps: int,
+    token_to_idx: Dict[str, int],
+    use_kv_cache: bool,
+    length_penalty_alpha: float,
+    encoder_kv_cache=None,
+):
+    import torch
+
+    from src.decoding.beam_search import (
+        BeamHypothesis,
+        BeamSearchConfig,
+        _apply_length_penalty,
+        _clone_grammar,
+        default_soft_penalty,
+    )
+    from src.decoding.grammar_fsa import GrammarFSA
+
+    search_config = BeamSearchConfig(
+        beam_width=beam_width,
+        max_steps=max_decode_steps,
+        length_penalty_alpha=length_penalty_alpha,
+    )
+    prefix_tokens = ["<bos>", "<staff_start>"]
+    prefix_ids = tuple(token_to_idx[token] for token in prefix_tokens)
+    grammar = GrammarFSA(vocabulary)
+    grammar.validate_sequence(prefix_tokens)
+    beams = [BeamHypothesis(tokens=prefix_tokens, score=0.0, grammar=grammar, state=_BeamDecodeState(prefix_ids))]
+    batch_memory_cache = {}
+    batch_encoder_kv_cache = {}
+    valid_token_index_cache: Dict[frozenset[str], Tuple[List[str], object]] = {}
+
+    def _memory_for_batch(batch_size: int):
+        if batch_size <= 1:
+            return memory
+        cached = batch_memory_cache.get(batch_size)
+        if cached is None:
+            cached = memory.expand(batch_size, -1, -1)
+            batch_memory_cache[batch_size] = cached
+        return cached
+
+    def _encoder_kv_for_batch(batch_size: int):
+        if encoder_kv_cache is None or batch_size <= 1:
+            return encoder_kv_cache
+        cached = batch_encoder_kv_cache.get(batch_size)
+        if cached is None:
+            cached = _expand_encoder_kv_cache(encoder_kv_cache, batch_size)
+            batch_encoder_kv_cache[batch_size] = cached
+        return cached
+
+    for _ in range(search_config.max_steps):
+        expanded: List[BeamHypothesis] = []
+        active_beams: List[BeamHypothesis] = []
+        for beam in beams:
+            if beam.is_complete:
+                expanded.append(beam)
+            else:
+                active_beams.append(beam)
+
+        if not active_beams:
+            beams = expanded
+            break
+
+        batch_size = len(active_beams)
+        if use_kv_cache and all(beam.state is not None and beam.state.cache is not None for beam in active_beams):
+            input_ids = torch.tensor(
+                [[beam.state.last_token_id] for beam in active_beams],
+                dtype=torch.long,
+                device=memory.device,
+            )
+            past_key_values = _stack_past_key_values([beam.state.cache for beam in active_beams])
+        else:
+            input_ids = torch.tensor(
+                [list(beam.state.token_ids) for beam in active_beams],
+                dtype=torch.long,
+                device=memory.device,
+            )
+            past_key_values = None
+
+        with torch.inference_mode():
+            logits, _, next_cache = decode_model.decode_tokens(
+                input_ids,
+                _memory_for_batch(batch_size),
+                past_key_values=past_key_values,
+                use_cache=bool(use_kv_cache),
+                encoder_kv_cache=_encoder_kv_for_batch(batch_size),
+            )
+        next_log_probs = torch.log_softmax(logits[:, -1, :], dim=-1).float()
+
+        for row_index, beam in enumerate(active_beams):
+            valid_tokens = beam.grammar.valid_next_tokens()
+            token_names, token_indices = _lookup_valid_token_index(
+                valid_tokens,
+                token_to_idx=token_to_idx,
+                device=next_log_probs.device,
+                cache=valid_token_index_cache,
+            )
+            if token_indices is None:
+                continue
+            token_scores = next_log_probs[row_index].index_select(0, token_indices).detach().cpu().tolist()
+            beam_cache = _slice_past_key_values(next_cache, row_index) if use_kv_cache else None
+
+            candidates = []
+            for token, token_score in zip(token_names, token_scores):
+                penalty = default_soft_penalty(beam.tokens, token)
+                candidates.append((token, float(token_score) - penalty))
+            if not candidates:
+                continue
+
+            candidates.sort(key=lambda item: item[1], reverse=True)
+            for token, adjusted_score in candidates[: search_config.beam_width]:
+                next_grammar = _clone_grammar(beam.grammar)
+                next_grammar.step(token, strict=True)
+                expanded.append(
+                    BeamHypothesis(
+                        tokens=[*beam.tokens, token],
+                        score=beam.score + adjusted_score,
+                        grammar=next_grammar,
+                        state=beam.state.append(token_to_idx[token], beam_cache),
+                    )
+                )
+
+        if not expanded:
+            break
+
+        expanded.sort(
+            key=lambda beam: _apply_length_penalty(
+                score=beam.score,
+                length=len(beam.tokens),
+                alpha=search_config.length_penalty_alpha,
+            ),
+            reverse=True,
+        )
+        beams = expanded[: search_config.beam_width]
+
+    beams.sort(
+        key=lambda beam: _apply_length_penalty(
+            score=beam.score,
+            length=len(beam.tokens),
+            alpha=search_config.length_penalty_alpha,
+        ),
+        reverse=True,
+    )
+    if not beams:
+        return ["<bos>", "<staff_start>", "<staff_end>", "<eos>"]
+    predicted = list(beams[0].tokens)
+    if not predicted or predicted[-1] != "<eos>":
+        predicted.append("<eos>")
+    return predicted
+
+
+def _decode_stage_b_tokens_sequential(
+    *,
+    decode_model,
+    memory,
+    vocabulary,
+    beam_width: int,
+    max_decode_steps: int,
+    token_to_idx: Dict[str, int],
+    use_kv_cache: bool,
+    length_penalty_alpha: float,
+    encoder_kv_cache=None,
+) -> List[str]:
+    import torch
+
+    from src.decoding.beam_search import (
+        BeamHypothesis,
+        BeamSearchConfig,
+        _apply_length_penalty,
+        _clone_grammar,
+        default_soft_penalty,
+    )
+    from src.decoding.grammar_fsa import GrammarFSA
+
+    search_config = BeamSearchConfig(
+        beam_width=beam_width,
+        max_steps=max_decode_steps,
+        length_penalty_alpha=length_penalty_alpha,
+    )
+    prefix_tokens = ["<bos>", "<staff_start>"]
+    prefix_ids = tuple(token_to_idx[token] for token in prefix_tokens)
+    grammar = GrammarFSA(vocabulary)
+    grammar.validate_sequence(prefix_tokens)
+    beams = [BeamHypothesis(tokens=prefix_tokens, score=0.0, grammar=grammar, state=_BeamDecodeState(prefix_ids))]
+    valid_token_index_cache: Dict[frozenset[str], Tuple[List[str], object]] = {}
+
+    for _ in range(search_config.max_steps):
+        expanded: List[BeamHypothesis] = []
+        all_complete = True
+
+        for beam in beams:
+            if beam.is_complete:
+                expanded.append(beam)
+                continue
+            all_complete = False
+
+            if use_kv_cache and beam.state.cache is not None:
+                input_ids = torch.tensor([[beam.state.last_token_id]], dtype=torch.long, device=memory.device)
+                past_key_values = beam.state.cache
+            else:
+                input_ids = torch.tensor([list(beam.state.token_ids)], dtype=torch.long, device=memory.device)
+                past_key_values = None
+
+            with torch.inference_mode():
+                logits, _, next_cache = decode_model.decode_tokens(
+                    input_ids,
+                    memory,
+                    past_key_values=past_key_values,
+                    use_cache=bool(use_kv_cache),
+                    encoder_kv_cache=encoder_kv_cache,
+                )
+            next_log_probs = torch.log_softmax(logits[0, -1], dim=-1).float()
+
+            token_names, token_indices = _lookup_valid_token_index(
+                beam.grammar.valid_next_tokens(),
+                token_to_idx=token_to_idx,
+                device=next_log_probs.device,
+                cache=valid_token_index_cache,
+            )
+            if token_indices is None:
+                continue
+
+            token_scores = next_log_probs.index_select(0, token_indices).detach().cpu().tolist()
+            candidates = []
+            for token, token_score in zip(token_names, token_scores):
+                penalty = default_soft_penalty(beam.tokens, token)
+                candidates.append((token, float(token_score) - penalty))
+            if not candidates:
+                continue
+
+            candidates.sort(key=lambda item: item[1], reverse=True)
+            next_beam_cache = next_cache if use_kv_cache else None
+            for token, adjusted_score in candidates[: search_config.beam_width]:
+                next_grammar = _clone_grammar(beam.grammar)
+                next_grammar.step(token, strict=True)
+                expanded.append(
+                    BeamHypothesis(
+                        tokens=[*beam.tokens, token],
+                        score=beam.score + adjusted_score,
+                        grammar=next_grammar,
+                        state=beam.state.append(token_to_idx[token], next_beam_cache),
+                    )
+                )
+
+        if not expanded:
+            break
+        if all_complete:
+            beams = expanded
+            break
+
+        expanded.sort(
+            key=lambda beam: _apply_length_penalty(
+                score=beam.score,
+                length=len(beam.tokens),
+                alpha=search_config.length_penalty_alpha,
+            ),
+            reverse=True,
+        )
+        beams = expanded[: search_config.beam_width]
+
+    beams.sort(
+        key=lambda beam: _apply_length_penalty(
+            score=beam.score,
+            length=len(beam.tokens),
+            alpha=search_config.length_penalty_alpha,
+        ),
+        reverse=True,
+    )
+    if not beams:
+        return ["<bos>", "<staff_start>", "<staff_end>", "<eos>"]
+    predicted = list(beams[0].tokens)
+    if not predicted or predicted[-1] != "<eos>":
+        predicted.append("<eos>")
+    return predicted
+
+
 def _decode_stage_b_tokens(
     *,
     model,
@@ -243,68 +598,43 @@ def _decode_stage_b_tokens(
     _precomputed=None,
 ) -> List[str]:
     """Decode tokens for a single staff crop.
-
-    Args:
-        _precomputed: optional dict with 'decode_model', 'memory', 'token_to_idx', 'use_fp16'
-                      to skip redundant model preparation and encoding.
     """
-    import torch
-
-    from src.decoding.beam_search import BeamSearchConfig, constrained_beam_search_with_state
 
     if _precomputed is not None:
         decode_model = _precomputed["decode_model"]
         memory = _precomputed["memory"]
         _token_to_idx = _precomputed["token_to_idx"]
-        use_fp16 = _precomputed["use_fp16"]
+        encoder_kv_cache = _precomputed.get("encoder_kv_cache")
     else:
-        decode_model, use_fp16 = _prepare_model_for_inference(model, pixel_values.device)
-        if use_fp16:
-            pixel_values = pixel_values.half()
+        decode_model = _prepare_model_for_inference(model)
         memory = _encode_staff_image(decode_model, pixel_values)
         _token_to_idx = {token: idx for idx, token in enumerate(vocabulary.tokens)}
+        encoder_kv_cache = _prepare_decoder_memory_cache(decode_model, memory)
 
     device = memory.device
-
-    def _step_fn(
-        prefix_tokens: Sequence[str],
-        parent_cache: object | None,
-    ) -> tuple[Dict[str, float], object | None]:
-        if not use_kv_cache or parent_cache is None:
-            token_ids = vocabulary.encode(prefix_tokens, strict=True)
-            input_ids = torch.tensor([token_ids], dtype=torch.long, device=device)
-            layer_cache = None
-        else:
-            if not prefix_tokens:
-                raise ValueError("Prefix tokens cannot be empty during cached decoding.")
-            token_ids = vocabulary.encode([prefix_tokens[-1]], strict=True)
-            input_ids = torch.tensor([token_ids], dtype=torch.long, device=device)
-            layer_cache = parent_cache
-
-        with torch.inference_mode():
-            logits, _, next_cache = decode_model.decode_tokens(
-                input_ids,
-                memory,
-                past_key_values=layer_cache,
-                use_cache=bool(use_kv_cache),
-            )
-        next_log_probs = torch.log_softmax(logits[0, -1], dim=-1).float().cpu()
-        distribution = _LazyLogitDict(next_log_probs, _token_to_idx)
-        return distribution, (next_cache if use_kv_cache else None)
-
-    beams = constrained_beam_search_with_state(
-        step_fn=_step_fn,
+    if device.type == "cuda":
+        return _decode_stage_b_tokens_batched(
+            decode_model=decode_model,
+            memory=memory,
+            vocabulary=vocabulary,
+            beam_width=beam_width,
+            max_decode_steps=max_decode_steps,
+            token_to_idx=_token_to_idx,
+            use_kv_cache=use_kv_cache,
+            length_penalty_alpha=length_penalty_alpha,
+            encoder_kv_cache=encoder_kv_cache,
+        )
+    return _decode_stage_b_tokens_sequential(
+        decode_model=decode_model,
+        memory=memory,
         vocabulary=vocabulary,
-        config=BeamSearchConfig(beam_width=beam_width, max_steps=max_decode_steps, length_penalty_alpha=length_penalty_alpha),
-        soft_penalty_fn=None,
-        prefix_tokens=["<bos>", "<staff_start>"],
+        beam_width=beam_width,
+        max_decode_steps=max_decode_steps,
+        token_to_idx=_token_to_idx,
+        use_kv_cache=use_kv_cache,
+        length_penalty_alpha=length_penalty_alpha,
+        encoder_kv_cache=encoder_kv_cache,
     )
-    if not beams:
-        return ["<bos>", "<staff_start>", "<staff_end>", "<eos>"]
-    predicted = list(beams[0].tokens)
-    if not predicted or predicted[-1] != "<eos>":
-        predicted.append("<eos>")
-    return predicted
 
 
 def run_stage_b(args: argparse.Namespace) -> Dict[str, object]:
@@ -326,7 +656,7 @@ def run_stage_b(args: argparse.Namespace) -> Dict[str, object]:
     device_name = str(args.device).strip() if args.device else ""
     device = torch.device(device_name if device_name else ("cuda" if torch.cuda.is_available() else "cpu"))
     vocab = build_default_vocabulary()
-    checkpoint_payload = torch.load(str(args.checkpoint), map_location=device)
+    checkpoint_payload = _load_stage_b_checkpoint_payload(args.checkpoint, device)
     fallback_factory_cfg = ModelFactoryConfig(stage_b_vocab_size=vocab.size)
     factory_cfg = model_factory_config_from_checkpoint_payload(
         checkpoint_payload,
@@ -343,11 +673,7 @@ def run_stage_b(args: argparse.Namespace) -> Dict[str, object]:
     model.eval()
 
     # Prepare model once for all crops
-    decode_model, use_fp16 = _prepare_model_for_inference(
-        model, device,
-        use_fp16=bool(getattr(args, "fp16", False)),
-        quantize=bool(getattr(args, "quantize", False)),
-    )
+    decode_model = _prepare_model_for_inference(model)
     _token_to_idx = {token: idx for idx, token in enumerate(vocab.tokens)}
 
     prediction_rows: List[Dict[str, object]] = []
@@ -367,9 +693,8 @@ def run_stage_b(args: argparse.Namespace) -> Dict[str, object]:
             image_max_width=min(3000, max(256, int(args.image_max_width))),
             device=device,
         )
-        if use_fp16:
-            pixel_values = pixel_values.half()
         memory = _encode_staff_image(decode_model, pixel_values)
+        encoder_kv_cache = _prepare_decoder_memory_cache(decode_model, memory)
 
         tokens = _decode_stage_b_tokens(
             model=model,
@@ -382,8 +707,8 @@ def run_stage_b(args: argparse.Namespace) -> Dict[str, object]:
             _precomputed={
                 "decode_model": decode_model,
                 "memory": memory,
+                "encoder_kv_cache": encoder_kv_cache,
                 "token_to_idx": _token_to_idx,
-                "use_fp16": use_fp16,
             },
         )
         row_with_tokens = dict(row)
@@ -500,8 +825,6 @@ def run_pipeline(args: argparse.Namespace) -> Dict[str, object]:
                 image_max_width=args.image_max_width,
                 device=args.stage_b_device,
                 kv_cache=args.stage_b_kv_cache,
-                fp16=getattr(args, "fp16", False),
-                quantize=getattr(args, "quantize", False),
             )
         )
 
@@ -551,7 +874,7 @@ def build_parser() -> argparse.ArgumentParser:
     stage_b_parser = subparsers.add_parser("stage-b", help="Run Stage-B staff recognition on crop manifest.")
     stage_b_parser.add_argument("--project-root", type=Path, default=Path.cwd(), help="Project root for relative crop paths.")
     stage_b_parser.add_argument("--crops-manifest", type=Path, required=True, help="Stage-A crop manifest JSONL.")
-    stage_b_parser.add_argument("--checkpoint", type=Path, required=True, help="Stage-B model checkpoint path.")
+    stage_b_parser.add_argument("--checkpoint", type=Path, required=True, help="Stage-B model checkpoint path (.safetensors).")
     stage_b_parser.add_argument("--output-predictions", type=Path, required=True, help="Output staff predictions JSONL.")
     stage_b_parser.add_argument("--beam-width", type=int, default=8, help="Constrained beam width.")
     stage_b_parser.add_argument("--max-decode-steps", type=int, default=512, help="Max decode steps per crop.")
@@ -565,9 +888,6 @@ def build_parser() -> argparse.ArgumentParser:
     stage_b_parser.add_argument("--image-height", type=int, default=250, help="Input image height for Stage-B.")
     stage_b_parser.add_argument("--image-max-width", type=int, default=2500, help="Input image max width for Stage-B (max 3000).")
     stage_b_parser.add_argument("--device", type=str, default=None, help="Inference device (e.g. cuda, cpu).")
-    stage_b_parser.add_argument("--fp16", action="store_true", help="Use FP16 inference on CUDA (trades precision for speed).")
-    stage_b_parser.add_argument("--quantize", action="store_true", help="INT8 dynamic quantization on decoder (CPU: 2-3x faster, GPU: needs torchao).")
-
     assemble_parser = subparsers.add_parser("assemble", help="Assemble staff predictions into systems and parts.")
     assemble_parser.add_argument("--staff-predictions", type=Path, required=True, help="Staff predictions JSONL.")
     assemble_parser.add_argument("--output-assembly", type=Path, required=True, help="Output assembly JSON.")
@@ -589,7 +909,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--stage-b-checkpoint",
         type=Path,
         default=None,
-        help="If staff predictions are not provided, run Stage-B inference with this checkpoint.",
+        help="If staff predictions are not provided, run Stage-B inference with this checkpoint (.safetensors).",
     )
     run_parser.add_argument("--work-dir", type=Path, required=True, help="Working directory for intermediate files.")
     run_parser.add_argument("--output-musicxml", type=Path, required=True, help="Output MusicXML file path.")
@@ -609,9 +929,6 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--image-height", type=int, default=250, help="Stage-B input height.")
     run_parser.add_argument("--image-max-width", type=int, default=2500, help="Stage-B input max width (max 3000).")
     run_parser.add_argument("--stage-b-device", type=str, default=None, help="Stage-B inference device.")
-    run_parser.add_argument("--fp16", action="store_true", help="Use FP16 inference on CUDA (trades precision for speed).")
-    run_parser.add_argument("--quantize", action="store_true", help="INT8 dynamic quantization on decoder (CPU: 2-3x faster, GPU: needs torchao).")
-
     return parser
 
 

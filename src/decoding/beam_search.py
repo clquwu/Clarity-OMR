@@ -429,11 +429,18 @@ def constrained_beam_search_with_state(
                 continue
 
             candidates = []
-            for token in valid_tokens:
-                if token not in logits:
-                    continue
-                penalty = penalty_fn(beam.tokens, token)
-                candidates.append((token, float(logits[token]) - penalty))
+            score_tokens = getattr(logits, "score_tokens", None)
+            if callable(score_tokens):
+                scored_tokens = score_tokens(valid_tokens)
+                for token, token_score in scored_tokens.items():
+                    penalty = penalty_fn(beam.tokens, token)
+                    candidates.append((token, float(token_score) - penalty))
+            else:
+                for token in valid_tokens:
+                    if token not in logits:
+                        continue
+                    penalty = penalty_fn(beam.tokens, token)
+                    candidates.append((token, float(logits[token]) - penalty))
             if not candidates:
                 continue
 

@@ -2,7 +2,7 @@
 
 Optical Music Recognition — convert PDF sheet music to MusicXML.
 
-Models are downloaded automatically from [HuggingFace](https://huggingface.co/clquwu/Clarity-OMR) on first run.
+Models are downloaded automatically from [HuggingFace](https://huggingface.co/clquwu/Clarity-OMR) on first run. Stage-B uses `info/model.safetensors`.
 
 ## Installation
 
@@ -37,7 +37,7 @@ pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
 
 See [pytorch.org/get-started](https://pytorch.org/get-started/locally/) for all available versions.
 
-**CPU-only users:** Skip this step. The CPU version of PyTorch will be installed automatically in the next step. INT8 quantization is enabled by default on CPU for faster inference.
+**CPU-only users:** Skip this step. The CPU version of PyTorch will be installed automatically in the next step.
 
 ### 3. Install dependencies
 
@@ -71,7 +71,7 @@ python omr.py score.pdf --fast
 
 ### What happens when you run it
 
-1. Models (`omr.pt`, `yolo.pt`) are downloaded from HuggingFace on first run (~1.5 GB total)
+1. Models are resolved on first run: `yolo.pt` and `info/model.safetensors` are downloaded from HuggingFace
 2. PDF is rendered to page images at 300 DPI
 3. YOLO detects staff regions on each page
 4. The OMR model recognizes music notation tokens from each staff crop

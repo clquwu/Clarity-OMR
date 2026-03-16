@@ -15,6 +15,12 @@ if __package__ in {None, ""}:
 from src.cli import run_assemble, run_export
 from src.manual_page_cropper import crop_pages_with_editor
 from src.eval.evaluate_stage_b_checkpoint import _run_stage_b_inference_with_progress
+from src.model_assets import (
+    default_stage_a_weights,
+    default_stage_b_checkpoint,
+    ensure_default_stage_a_weights,
+    ensure_default_stage_b_checkpoint,
+)
 from src.models.yolo_stage_a import YoloStageA, YoloStageAConfig
 from src.pipeline.export_musicxml import _write_musicxml_safe, assembled_score_to_music21, load_assembled_score, validate_musicxml_roundtrip
 
@@ -163,14 +169,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--weights",
         type=Path,
-        default=project_root / "info" / "yolo.pt",
-        help="Stage-A YOLO weights path (default: info/best.pt).",
+        default=default_stage_a_weights(project_root),
+        help="Stage-A YOLO weights path.",
     )
     parser.add_argument(
         "--stage-b-checkpoint",
         type=Path,
-        default=project_root / "info" / "stage2-polyphonic_step_0071000.pt",
-        help="Stage-B checkpoint path.",
+        default=default_stage_b_checkpoint(project_root),
+        help="Stage-B checkpoint path (.safetensors).",
     )
     parser.add_argument("--confidence", type=float, default=0.25, help="YOLO confidence threshold.")
     parser.add_argument("--iou", type=float, default=0.45, help="YOLO IoU threshold.")
@@ -214,8 +220,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--stage-b-device", type=str, default=None, help="Stage-B device (e.g. cuda, cpu).")
     parser.add_argument("--progress-every-seconds", type=float, default=10.0, help="Stage-B progress log interval.")
     parser.add_argument("--quiet", action="store_true", help="Disable Stage-B progress logs.")
-    parser.add_argument("--fp16", action="store_true", help="Use FP16 inference on CUDA (trades precision for speed).")
-    parser.add_argument("--quantize", action="store_true", help="INT8 dynamic quantization on decoder (CPU: 2-3x faster, GPU: needs torchao).")
     parser.add_argument(
         "--strict-export",
         action="store_true",
@@ -238,6 +242,11 @@ def main() -> None:
         if args.stage_b_checkpoint.is_absolute()
         else (project_root / args.stage_b_checkpoint)
     ).resolve()
+
+    if weights == default_stage_a_weights(project_root).resolve():
+        weights = ensure_default_stage_a_weights(project_root).resolve()
+    if stage_b_checkpoint == default_stage_b_checkpoint(project_root).resolve():
+        stage_b_checkpoint = ensure_default_stage_b_checkpoint(project_root).resolve()
 
     if not pdf_path.exists():
         raise FileNotFoundError(f"PDF not found: {pdf_path}")
@@ -363,8 +372,6 @@ def main() -> None:
         quiet=bool(args.quiet),
         length_penalty_alpha=float(args.length_penalty_alpha),
         use_kv_cache=bool(args.stage_b_kv_cache),
-        use_fp16=bool(getattr(args, "fp16", False)),
-        quantize=bool(getattr(args, "quantize", False)),
     )
 
     assembly_manifest = work_dir / "assembled_score.json"
