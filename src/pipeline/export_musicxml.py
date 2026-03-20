@@ -27,8 +27,6 @@ DURATION_QUARTER_LENGTH = {
     "_sixty_fourth": 0.0625,
 }
 
-TUPLET_NORMAL = {3: 2.0, 5: 4.0, 6: 5.0, 7: 6.0}
-
 _XML_NAMESPACE_SCHEMA = """<?xml version="1.0" encoding="UTF-8"?>
 <xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
            targetNamespace="http://www.w3.org/XML/1998/namespace"
@@ -163,10 +161,10 @@ def _parse_grace_pitch_token(token: str) -> str:
 
 def _decode_duration(tokens: Sequence[str], start_index: int) -> Tuple[float, int]:
     index = start_index
-    tuplet_ratio: Optional[int] = None
     while index < len(tokens) and tokens[index].startswith("<tuplet_"):
-        raw = tokens[index].strip("<>").split("_")[-1]
-        tuplet_ratio = int(raw)
+        # Tuplet predictions are currently unreliable in the OMR output and
+        # produce false triplet timing in MusicXML. Consume the tokens so the
+        # stream stays aligned, but ignore their timing effect in export.
         index += 1
 
     if index >= len(tokens):
@@ -183,10 +181,6 @@ def _decode_duration(tokens: Sequence[str], start_index: int) -> Tuple[float, in
     elif index < len(tokens) and tokens[index] == "_double_dot":
         quarter_length *= 1.75
         index += 1
-
-    if tuplet_ratio is not None:
-        normal = TUPLET_NORMAL.get(tuplet_ratio, 2.0)
-        quarter_length *= normal / float(tuplet_ratio)
     return quarter_length, index
 
 
