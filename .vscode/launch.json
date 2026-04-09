@@ -1,0 +1,13 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Omr",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/omr.py",
+            "console": "integratedTerminal",
+            "args": "${command:pickArgs}"
+        }
+    ]
+}
