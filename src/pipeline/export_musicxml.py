@@ -837,6 +837,67 @@ def write_musicxml(
     return validation
 
 
+def write_musicxml_per_system(
+    score: AssembledScore,
+    output_stem: Path,
+) -> List[Dict[str, object]]:
+    """Export one MusicXML file per system.
+
+    Files are written as ``<output_stem>_systems/page_0001_system_01.musicxml``, etc.
+    Returns a list of validation dicts (one per system) in page/system order.
+    """
+    folder = output_stem.parent / f"{output_stem.stem}_systems"
+    systems = sorted(score.systems, key=lambda s: (s.page_index, s.system_index))
+    results: List[Dict[str, object]] = []
+    system_counter_per_page: Dict[int, int] = {}
+    for system in systems:
+        system_score = AssembledScore(systems=[system], part_order=list(score.part_order))
+        page_num = system.page_index + 1
+        sys_num = system_counter_per_page[system.page_index] = system_counter_per_page.get(system.page_index, 0) + 1
+        system_path = folder / f"page_{page_num:04d}_system_{sys_num:02d}.musicxml"
+        try:
+            validation = write_musicxml(system_score, system_path)
+        except (ValueError, KeyError) as exc:
+            music_score = assembled_score_to_music21(system_score)
+            system_path.parent.mkdir(parents=True, exist_ok=True)
+            _write_musicxml_safe(music_score, system_path)
+            validation = {"schema_valid": False, "best_effort": True, "warning": str(exc), "output_path": str(system_path)}
+        results.append(validation)
+    return results
+
+
+def write_musicxml_per_page(
+    score: AssembledScore,
+    output_stem: Path,
+) -> List[Dict[str, object]]:
+    """Export one MusicXML file per page.
+
+    Files are written as ``<output_stem>_pages/page_0001.musicxml``, etc.
+    Returns a list of validation dicts (one per page) in page order.
+    """
+    from collections import defaultdict
+
+    folder = output_stem.parent / f"{output_stem.stem}_pages"
+    systems_by_page: Dict[int, List] = defaultdict(list)
+    for system in score.systems:
+        systems_by_page[system.page_index].append(system)
+
+    results: List[Dict[str, object]] = []
+    for page_index in sorted(systems_by_page):
+        page_systems = sorted(systems_by_page[page_index], key=lambda s: s.system_index)
+        page_score = AssembledScore(systems=page_systems, part_order=list(score.part_order))
+        page_path = folder / f"page_{page_index + 1:04d}.musicxml"
+        try:
+            validation = write_musicxml(page_score, page_path)
+        except (ValueError, KeyError) as exc:
+            music_score = assembled_score_to_music21(page_score)
+            page_path.parent.mkdir(parents=True, exist_ok=True)
+            _write_musicxml_safe(music_score, page_path)
+            validation = {"schema_valid": False, "best_effort": True, "warning": str(exc), "output_path": str(page_path)}
+        results.append(validation)
+    return results
+
+
 def load_assembled_score(path: Path) -> AssembledScore:
     payload = json.loads(path.read_text(encoding="utf-8"))
     systems: List[AssembledSystem] = []
