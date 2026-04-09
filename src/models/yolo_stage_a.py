@@ -117,6 +117,7 @@ class StaffCrop:
 
 @dataclass
 class YoloStageAConfig:
+    merge_system_staves: bool = True
     weights_path: Optional[Path] = None
     confidence_threshold: float = 0.25
     iou_threshold: float = 0.45
@@ -437,95 +438,132 @@ class YoloStageA:
             system_x_bounds.append((system_x_min, system_x_max))
 
         for system_idx, system_compact in enumerate(all_compact_systems):
-            for staff_idx, detection in enumerate(system_compact):
-                staff_h = detection.bbox.height
-                desired_v_pad = staff_h * self.config.vertical_padding_ratio
-                left_pad = detection.bbox.width * self.config.horizontal_padding_ratio
-                right_pad = max(
-                    detection.bbox.width * self.config.horizontal_padding_ratio,
-                    float(self.config.min_right_padding_px),
-                )
-                min_v_pad = max(staff_h * 0.05, float(self.config.min_vertical_padding_px))
+            if bool(self.config.merge_system_staves):
+                # One crop per system: union all staff bboxes vertically.
+                system_y_min = min(det.bbox.y_min for det in system_compact)
+                system_y_max = max(det.bbox.y_max for det in system_compact)
+                staff_heights_in_sys = [det.bbox.height for det in system_compact]
+                median_staff_h = sorted(staff_heights_in_sys)[len(staff_heights_in_sys) // 2]
+                desired_v_pad = median_staff_h * self.config.vertical_padding_ratio
+                min_v_pad = max(median_staff_h * 0.05, float(self.config.min_vertical_padding_px))
 
                 # Find nearest neighbor gaps above and below, tracking same vs cross-system.
                 nearest_above_gap = float("inf")
-                above_same_system = False
                 nearest_below_gap = float("inf")
-                below_same_system = False
                 for other_bbox, other_sys_idx in all_staff_entries:
-                    if other_bbox is detection.bbox:
+                    if other_sys_idx == system_idx:
                         continue
-                    if other_bbox.y_center < detection.bbox.y_center:
-                        gap = detection.bbox.y_min - other_bbox.y_max
+                    if other_bbox.y_center < system_y_min:
+                        gap = system_y_min - other_bbox.y_max
                         if gap < nearest_above_gap:
                             nearest_above_gap = gap
-                            above_same_system = (other_sys_idx == system_idx)
-                    elif other_bbox.y_center > detection.bbox.y_center:
-                        gap = other_bbox.y_min - detection.bbox.y_max
+                    elif other_bbox.y_center > system_y_max:
+                        gap = other_bbox.y_min - system_y_max
                         if gap < nearest_below_gap:
                             nearest_below_gap = gap
-                            below_same_system = (other_sys_idx == system_idx)
 
                 # Adaptive padding: generous (70%) for same-system neighbors (piano
                 # grand staff where content extends between staves), strict (45%)
                 # for cross-system neighbors to avoid capturing other systems.
-                def _clamp_pad(desired: float, gap: float, same_system: bool) -> float:
+                def _clamp_pad_sys(desired: float, gap: float) -> float:
                     if gap <= 0:
                         return min_v_pad
-                    ratio = 0.70 if same_system else 0.45
-                    return max(min_v_pad, min(desired, gap * ratio))
+                    return max(min_v_pad, min(desired, gap * 0.55))
 
-                if nearest_above_gap < float("inf"):
-                    top_pad = _clamp_pad(desired_v_pad, nearest_above_gap, above_same_system)
-                else:
-                    top_pad = desired_v_pad
-
-                if nearest_below_gap < float("inf"):
-                    bottom_pad = _clamp_pad(desired_v_pad, nearest_below_gap, below_same_system)
-                else:
-                    bottom_pad = desired_v_pad
+                top_pad = _clamp_pad_sys(desired_v_pad, nearest_above_gap) if nearest_above_gap < float("inf") else desired_v_pad
+                bottom_pad = _clamp_pad_sys(desired_v_pad, nearest_below_gap) if nearest_below_gap < float("inf") else desired_v_pad
 
                 padded = BoundingBox(
-                    x_min=detection.bbox.x_min - left_pad,
-                    y_min=detection.bbox.y_min - top_pad,
-                    x_max=detection.bbox.x_max + right_pad,
-                    y_max=detection.bbox.y_max + bottom_pad,
+                    x_min=0.0,
+                    y_min=system_y_min - top_pad,
+                    x_max=float(width),
+                    y_max=system_y_max + bottom_pad,
                 ).clip(image_width=width, image_height=height)
-                if bool(self.config.enforce_full_width_crops):
-                    system_x_min, system_x_max = system_x_bounds[system_idx]
-                    padded = BoundingBox(
-                        x_min=system_x_min,
-                        y_min=padded.y_min,
-                        x_max=min(float(width), system_x_max + float(self.config.min_right_padding_px)),
-                        y_max=padded.y_max,
-                    ).padded(
-                        vertical_ratio=0.0,
-                        horizontal_ratio=self.config.horizontal_padding_ratio,
-                    ).clip(image_width=width, image_height=height)
-                x0 = int(round(padded.x_min))
-                y0 = int(round(padded.y_min))
-                x1 = int(round(padded.x_max))
-                y1 = int(round(padded.y_max))
+
+                x0, y0, x1, y1 = int(round(padded.x_min)), int(round(padded.y_min)), int(round(padded.x_max)), int(round(padded.y_max))
                 if x1 <= x0 or y1 <= y0:
                     continue
                 crop = image.crop((x0, y0, x1, y1))
-                crop_name = f"{safe_stem}__sys{system_idx:02d}__staff{staff_idx:02d}.png"
+                crop_name = f"{safe_stem}__sys{system_idx:02d}.png"
                 crop_path = output_dir / crop_name
                 try:
                     crop.save(str(crop_path))
                 except OSError:
-                    fallback_name = f"{safe_stem}__sys{system_idx:02d}__staff{staff_idx:02d}__alt.png"
-                    crop_path = output_dir / fallback_name
+                    crop_path = output_dir / f"{safe_stem}__sys{system_idx:02d}__alt.png"
                     crop.save(str(crop_path))
-                crops.append(
-                    StaffCrop(
-                        source_image=str(image_path),
-                        crop_path=str(crop_path),
-                        system_index=system_idx,
-                        staff_index=staff_idx,
-                        bbox=padded,
+                crops.append(StaffCrop(source_image=str(image_path), crop_path=str(crop_path), system_index=system_idx, staff_index=0, bbox=padded))
+            else:
+                for staff_idx, detection in enumerate(system_compact):
+                    staff_h = detection.bbox.height
+                    desired_v_pad = staff_h * self.config.vertical_padding_ratio
+                    left_pad = detection.bbox.width * self.config.horizontal_padding_ratio
+                    right_pad = max(
+                        detection.bbox.width * self.config.horizontal_padding_ratio,
+                        float(self.config.min_right_padding_px),
                     )
-                )
+                    min_v_pad = max(staff_h * 0.05, float(self.config.min_vertical_padding_px))
+
+                    # Find nearest neighbor gaps above and below, tracking same vs cross-system.
+                    nearest_above_gap = float("inf")
+                    above_same_system = False
+                    nearest_below_gap = float("inf")
+                    below_same_system = False
+                    for other_bbox, other_sys_idx in all_staff_entries:
+                        if other_bbox is detection.bbox:
+                            continue
+                        if other_bbox.y_center < detection.bbox.y_center:
+                            gap = detection.bbox.y_min - other_bbox.y_max
+                            if gap < nearest_above_gap:
+                                nearest_above_gap = gap
+                                above_same_system = (other_sys_idx == system_idx)
+                        elif other_bbox.y_center > detection.bbox.y_center:
+                            gap = other_bbox.y_min - detection.bbox.y_max
+                            if gap < nearest_below_gap:
+                                nearest_below_gap = gap
+                                below_same_system = (other_sys_idx == system_idx)
+
+                    # Adaptive padding: generous (70%) for same-system neighbors (piano
+                    # grand staff where content extends between staves), strict (45%)
+                    # for cross-system neighbors to avoid capturing other systems.
+                    def _clamp_pad(desired: float, gap: float, same_system: bool) -> float:
+                        if gap <= 0:
+                            return min_v_pad
+                        ratio = 0.70 if same_system else 0.55
+                        return max(min_v_pad, min(desired, gap * ratio))
+
+                    top_pad = _clamp_pad(desired_v_pad, nearest_above_gap, above_same_system) if nearest_above_gap < float("inf") else desired_v_pad
+                    bottom_pad = _clamp_pad(desired_v_pad, nearest_below_gap, below_same_system) if nearest_below_gap < float("inf") else desired_v_pad
+
+                    padded = BoundingBox(
+                        x_min=detection.bbox.x_min - left_pad,
+                        y_min=detection.bbox.y_min - top_pad,
+                        x_max=detection.bbox.x_max + right_pad,
+                        y_max=detection.bbox.y_max + bottom_pad,
+                    ).clip(image_width=width, image_height=height)
+                    if bool(self.config.enforce_full_width_crops):
+                        system_x_min, system_x_max = system_x_bounds[system_idx]
+                        padded = BoundingBox(
+                            x_min=system_x_min,
+                            y_min=padded.y_min,
+                            x_max=min(float(width), system_x_max + float(self.config.min_right_padding_px)),
+                            y_max=padded.y_max,
+                        ).padded(
+                            vertical_ratio=0.0,
+                            horizontal_ratio=self.config.horizontal_padding_ratio,
+                        ).clip(image_width=width, image_height=height)
+
+                    x0, y0, x1, y1 = int(round(padded.x_min)), int(round(padded.y_min)), int(round(padded.x_max)), int(round(padded.y_max))
+                    if x1 <= x0 or y1 <= y0:
+                        continue
+                    crop = image.crop((x0, y0, x1, y1))
+                    crop_name = f"{safe_stem}__sys{system_idx:02d}__staff{staff_idx:02d}.png"
+                    crop_path = output_dir / crop_name
+                    try:
+                        crop.save(str(crop_path))
+                    except OSError:
+                        crop_path = output_dir / f"{safe_stem}__sys{system_idx:02d}__staff{staff_idx:02d}__alt.png"
+                        crop.save(str(crop_path))
+                    crops.append(StaffCrop(source_image=str(image_path), crop_path=str(crop_path), system_index=system_idx, staff_index=staff_idx, bbox=padded))
         return crops
 
     def write_crop_manifest(self, crops: Sequence[StaffCrop], output_path: Path) -> None:

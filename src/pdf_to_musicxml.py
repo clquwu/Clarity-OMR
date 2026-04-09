@@ -199,6 +199,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=False,
         help="When full-width mode is enabled, force crop x_max to page right edge.",
     )
+    parser.add_argument(
+        "--merge-system-staves",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Merge all staves within a system into one crop (e.g. piano grand staff). Use --no-merge-system-staves for one crop per staff.",
+    )
     parser.add_argument("--pdf-dpi", type=int, default=300, help="PDF render DPI.")
     parser.add_argument(
         "--manual-page-crop",
@@ -324,6 +330,7 @@ def main() -> None:
                 enforce_full_width_crops=bool(args.enforce_full_width_crops),
                 full_width_left_page_edge=bool(args.full_width_left_page_edge),
                 full_width_right_page_edge=bool(args.full_width_right_page_edge),
+                merge_system_staves=bool(args.merge_system_staves),
             )
         )
         for page_index, page_image in enumerate(page_images):
