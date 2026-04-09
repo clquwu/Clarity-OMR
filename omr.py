@@ -50,6 +50,9 @@ def main() -> None:
     parser.add_argument("--work-dir", type=Path, default=None, help="Working directory for intermediate files.")
     parser.add_argument("--device", type=str, default=None, help="Force device (cuda or cpu).")
     parser.add_argument("--pdf-dpi", type=int, default=300, help="PDF render DPI (default: 300).")
+    export_group = parser.add_mutually_exclusive_group()
+    export_group.add_argument("--export-pages", action="store_true", help="Export one MusicXML file per page.")
+    export_group.add_argument("--export-systems", action="store_true", help="Export one MusicXML file per system.")
     args = parser.parse_args()
 
     # Resolve paths
@@ -99,6 +102,10 @@ def main() -> None:
         "--pdf-dpi", str(args.pdf_dpi),
         "--stage-b-device", device,
     ]
+    if args.export_systems:
+        pipeline_argv.append("--export-systems")
+    elif args.export_pages:
+        pipeline_argv.append("--export-pages")
     saved_argv = sys.argv
     sys.argv = ["omr.py"] + pipeline_argv
     try:

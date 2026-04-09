@@ -22,7 +22,7 @@ from src.model_assets import (
     ensure_default_stage_b_checkpoint,
 )
 from src.models.yolo_stage_a import YoloStageA, YoloStageAConfig
-from src.pipeline.export_musicxml import _write_musicxml_safe, assembled_score_to_music21, load_assembled_score, validate_musicxml_roundtrip
+from src.pipeline.export_musicxml import _write_musicxml_safe, assembled_score_to_music21, load_assembled_score, validate_musicxml_roundtrip, write_musicxml_per_page, write_musicxml_per_system
 
 
 def _write_jsonl(path: Path, rows: Iterable[Dict[str, object]]) -> None:
@@ -225,6 +225,17 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Fail if MusicXML does not pass XSD validation (default: write best-effort output).",
     )
+    export_group = parser.add_mutually_exclusive_group()
+    export_group.add_argument(
+        "--export-pages",
+        action="store_true",
+        help="Export one MusicXML file per page instead of a single combined file.",
+    )
+    export_group.add_argument(
+        "--export-systems",
+        action="store_true",
+        help="Export one MusicXML file per system instead of a single combined file.",
+    )
     return parser
 
 
@@ -381,31 +392,51 @@ def main() -> None:
             output_assembly=assembly_manifest,
         )
     )
-    try:
-        export_result = run_export(
-            argparse.Namespace(
-                assembly_manifest=assembly_manifest,
-                output_musicxml=output_musicxml,
-            )
-        )
-    except (ValueError, KeyError) as exc:
-        if bool(args.strict_export) and isinstance(exc, ValueError):
-            raise
-        # Best-effort fallback: write MusicXML even if schema validation or voice consistency fails.
+    separate_pages = bool(getattr(args, "export_pages", False))
+    separate_systems = bool(getattr(args, "export_systems", False))
+
+    if separate_pages:
         assembled = load_assembled_score(assembly_manifest)
-        music_score = assembled_score_to_music21(assembled)
-        output_musicxml.parent.mkdir(parents=True, exist_ok=True)
-        _write_musicxml_safe(music_score, output_musicxml)
-        try:
-            validation = validate_musicxml_roundtrip(music_score)
-        except (KeyError, Exception):
-            validation = {"schema_valid": False, "best_effort_validation_skipped": True}
+        page_results = write_musicxml_per_page(assembled, output_musicxml)
         export_result = {
-            **validation,
-            "output_path": str(output_musicxml),
-            "best_effort": True,
-            "warning": str(exc),
+            "separate_pages": True,
+            "pages": page_results,
+            "output_paths": [r.get("output_path") for r in page_results],
         }
+    elif separate_systems:
+        assembled = load_assembled_score(assembly_manifest)
+        system_results = write_musicxml_per_system(assembled, output_musicxml)
+        export_result = {
+            "separate_systems": True,
+            "systems": system_results,
+            "output_paths": [r.get("output_path") for r in system_results],
+        }
+    else:
+        try:
+            export_result = run_export(
+                argparse.Namespace(
+                    assembly_manifest=assembly_manifest,
+                    output_musicxml=output_musicxml,
+                )
+            )
+        except (ValueError, KeyError) as exc:
+            if bool(args.strict_export) and isinstance(exc, ValueError):
+                raise
+            # Best-effort fallback: write MusicXML even if schema validation or voice consistency fails.
+            assembled = load_assembled_score(assembly_manifest)
+            music_score = assembled_score_to_music21(assembled)
+            output_musicxml.parent.mkdir(parents=True, exist_ok=True)
+            _write_musicxml_safe(music_score, output_musicxml)
+            try:
+                validation = validate_musicxml_roundtrip(music_score)
+            except (KeyError, Exception):
+                validation = {"schema_valid": False, "best_effort_validation_skipped": True}
+            export_result = {
+                **validation,
+                "output_path": str(output_musicxml),
+                "best_effort": True,
+                "warning": str(exc),
+            }
 
     result = {
         "pdf": str(pdf_path),
@@ -419,7 +450,8 @@ def main() -> None:
             "stage_a_manifest": str(stage_a_manifest),
             "stage_b_predictions": str(stage_b_predictions),
             "assembly_manifest": str(assembly_manifest),
-            "musicxml": str(output_musicxml),
+            "musicxml": str(output_musicxml) if not (separate_pages or separate_systems) else None,
+            "musicxml_files": export_result.get("output_paths") if (separate_pages or separate_systems) else None,
             "manual_page_crops": str(manual_crop_metadata) if manual_crop_metadata is not None else None,
         },
     }
