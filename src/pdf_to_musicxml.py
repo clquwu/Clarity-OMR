@@ -182,10 +182,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--iou", type=float, default=0.45, help="YOLO IoU threshold.")
     parser.add_argument("--dedupe-iou-threshold", type=float, default=0.85, help="IoU threshold for duplicate staff-box removal.")
     parser.add_argument(
-        "--enforce-full-width-crops",
+        "--width-crops",
         action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Use each system's full detected x-span for all crops, with fixed extra padding.",
+        default=False,
+        help="Crop the image to the width of the music staff instead of using the full page width.",
     )
     parser.add_argument(
         "--full-width-left-page-edge",
@@ -196,7 +196,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--full-width-right-page-edge",
         action=argparse.BooleanOptionalAction,
-        default=False,
+        default=True,
         help="When full-width mode is enabled, force crop x_max to page right edge.",
     )
     parser.add_argument("--pdf-dpi", type=int, default=300, help="PDF render DPI.")
@@ -321,7 +321,7 @@ def main() -> None:
                 confidence_threshold=float(args.confidence),
                 iou_threshold=float(args.iou),
                 dedupe_iou_threshold=float(args.dedupe_iou_threshold),
-                enforce_full_width_crops=bool(args.enforce_full_width_crops),
+                width_crops=bool(args.width_crops),
                 full_width_left_page_edge=bool(args.full_width_left_page_edge),
                 full_width_right_page_edge=bool(args.full_width_right_page_edge),
             )

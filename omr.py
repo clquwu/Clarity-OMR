@@ -50,6 +50,7 @@ def main() -> None:
     parser.add_argument("--work-dir", type=Path, default=None, help="Working directory for intermediate files.")
     parser.add_argument("--device", type=str, default=None, help="Force device (cuda or cpu).")
     parser.add_argument("--pdf-dpi", type=int, default=300, help="PDF render DPI (default: 300).")
+    parser.add_argument("--width-crops", action="store_true", help="Force width crops (default: False).")
     args = parser.parse_args()
 
     # Resolve paths
@@ -99,6 +100,8 @@ def main() -> None:
         "--pdf-dpi", str(args.pdf_dpi),
         "--stage-b-device", device,
     ]
+    if args.width_crops:
+        pipeline_argv.append("--width-crops")
     saved_argv = sys.argv
     sys.argv = ["omr.py"] + pipeline_argv
     try:
